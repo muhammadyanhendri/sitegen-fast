@@ -18,7 +18,6 @@ const MARK_RE = /\p{M}/gu;
 const NON_ASCII_RE = /[^\x00-\x7F]/;
 const WS_RE = /\s/;
 const CONTINUED_RE = /^ {2,}\S/;
-const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 const RESERVED = ['posts', 'tags', 'page'];
 const FM_KEYS = ['title', 'date', 'tags', 'draft', 'layout', 'slug', 'summary'];
 const INCLUDE_DEPTH = 8;
@@ -93,10 +92,28 @@ function longDate(S, date) {
   return hit;
 }
 
-/** The words of a body: its runs of characters other than whitespace. */
-function wordsOf(text) {
-  const m = text.match(/\S+/g);
-  return m === null ? 0 : m.length;
+/** Whether the code unit `c` is JavaScript whitespace (the \s set). */
+function isSpaceCode(c) {
+  return c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 160 || c === 5760 ||
+    (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279;
+}
+
+/** The words of a body's lines: runs of characters other than whitespace. A word
+ * never spans a line (the join between lines is a newline, itself whitespace),
+ * so counting per line equals counting the joined body, with no join built. */
+function countWords(lines) {
+  let count = 0;
+  for (const line of lines) {
+    let inWord = false;
+    for (let i = 0; i < line.length; i++) {
+      if (isSpaceCode(line.charCodeAt(i))) inWord = false;
+      else if (!inWord) {
+        inWord = true;
+        count++;
+      }
+    }
+  }
+  return count;
 }
 
 /** Whether `line` holds only spaces and tabs (or is empty). */
@@ -123,9 +140,9 @@ function stripTrailing(s) {
 
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 
-/** `rel` (a link's path, "/"-separated) from the directory `dir` of a source, or null when it climbs out of the root. */
-function resolvePath(dir, rel) {
-  const parts = dir === '' ? [] : dir.split('/');
+/** `rel` (a link's path, "/"-separated) from the directory `dirParts` of a source, or null when it climbs out of the root. */
+function resolvePath(dirParts, rel) {
+  const parts = dirParts.slice();
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
     if (seg === '..') {
@@ -337,11 +354,11 @@ function endsParagraph(line) {
   return isBlank(line) || fenceLang(line) !== null || headingOf(line) !== null || isHr(line);
 }
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
-function findUnescaped(s, what, from) {
-  const last = s.length - what.length;
+/** The first index from `from` below `to` where `s` holds `what` outside a backslash escape, or -1. */
+function findUnescaped(s, what, from, to) {
+  const last = to - what.length;
   for (let j = from; j <= last; j++) {
-    if (s.charCodeAt(j) === 92 && j + 1 < s.length && ESCAPABLE[s.charCodeAt(j + 1)] === 1) {
+    if (s.charCodeAt(j) === 92 && j + 1 < to && ESCAPABLE[s.charCodeAt(j + 1)] === 1) {
       j++;
       continue;
     }
@@ -350,11 +367,11 @@ function findUnescaped(s, what, from) {
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
-function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
+/** The first single * from `from` below `to` (one whose run is not **), outside an escape, or -1. */
+function findSingleStar(s, from, to) {
+  for (let j = from; j < to; j++) {
     const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < s.length && ESCAPABLE[s.charCodeAt(j + 1)] === 1) {
+    if (c === 92 && j + 1 < to && ESCAPABLE[s.charCodeAt(j + 1)] === 1) {
       j++;
       continue;
     }
@@ -369,13 +386,15 @@ function findSingleStar(s, from) {
 }
 
 /**
- * `s` rendered inline into `out`; `link(target)` resolves a link's href.
- * Plain runs are flushed whole (one escape pass each) instead of per character.
+ * `s[lo..hi)` rendered inline into `out`; `link(target)` resolves a link's href.
+ * Plain runs are flushed whole (one escape pass each) instead of per character,
+ * and nested strong, emphasis and link text are rendered by range, never sliced
+ * out of the string, so no copy of the inner text is ever built.
  */
-function renderInline(s, link, out) {
-  const n = s.length;
-  let i = 0;
-  let seg = 0;
+function renderInline(s, link, out, lo, hi) {
+  const n = hi;
+  let i = lo;
+  let seg = lo;
   while (i < n) {
     const c = s.charCodeAt(i);
     if (c === 92) {
@@ -393,7 +412,7 @@ function renderInline(s, link, out) {
     }
     if (c === 96) {
       const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
+      if (j > i + 1 && j < n) {
         if (seg < i) out.push(escapeHtml(s.slice(seg, i)));
         out.push('<code>', escapeHtml(s.slice(i + 1, j)), '</code>');
         i = j + 1;
@@ -405,11 +424,11 @@ function renderInline(s, link, out) {
     }
     if (c === 42) {
       if (s.charCodeAt(i + 1) === 42) {
-        const j = findUnescaped(s, '**', i + 2);
+        const j = findUnescaped(s, '**', i + 2, n);
         if (j > i + 2) {
           if (seg < i) out.push(escapeHtml(s.slice(seg, i)));
           out.push('<strong>');
-          renderInline(s.slice(i + 2, j), link, out);
+          renderInline(s, link, out, i + 2, j);
           out.push('</strong>');
           i = j + 2;
           seg = i;
@@ -418,11 +437,11 @@ function renderInline(s, link, out) {
         i += 2;
         continue;
       }
-      const j = findSingleStar(s, i + 1);
+      const j = findSingleStar(s, i + 1, n);
       if (j > i + 1) {
         if (seg < i) out.push(escapeHtml(s.slice(seg, i)));
         out.push('<em>');
-        renderInline(s.slice(i + 1, j), link, out);
+        renderInline(s, link, out, i + 1, j);
         out.push('</em>');
         i = j + 1;
         seg = i;
@@ -432,15 +451,15 @@ function renderInline(s, link, out) {
       continue;
     }
     if (c === 91) {
-      const k = findUnescaped(s, ']', i + 1);
+      const k = findUnescaped(s, ']', i + 1, n);
       let m = -1;
       if (k !== -1 && s.charCodeAt(k + 1) === 40) m = s.indexOf(')', k + 2);
-      if (m !== -1) {
+      if (m !== -1 && m < n) {
         const target = s.slice(k + 2, m);
         if (target !== '' && !hasWhitespace(target)) {
           if (seg < i) out.push(escapeHtml(s.slice(seg, i)));
           out.push('<a href="', escapeHtml(link(target)), '">');
-          renderInline(s.slice(i + 1, k), link, out);
+          renderInline(s, link, out, i + 1, k);
           out.push('</a>');
           i = m + 1;
           seg = i;
@@ -465,6 +484,9 @@ function renderMarkdown(lines, link, S) {
   const ids = new Set();
   const blocks = [];
   const toc = [];
+  // One scratch array for every inline render in this page, reused block to
+  // block instead of allocated per paragraph, heading or list item.
+  const tmp = [];
   let excerpt = null;
   let i = 0;
   const n = lines.length;
@@ -481,16 +503,17 @@ function renderMarkdown(lines, link, S) {
       while (i < n && !fenceClose(lines[i])) body.push(lines[i++]);
       i++;
       const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`;
-      let code = '';
-      for (const l of body) code += `${escapeHtml(l)}\n`;
+      // Escaping is per character, so one escape over the joined body plus a
+      // trailing newline equals escaping each line and adding one after it.
+      const code = body.length === 0 ? '' : `${escapeHtml(body.join('\n'))}\n`;
       blocks.push(`<pre><code${cls}>${code}</code></pre>\n`);
       continue;
     }
     const h = headingOf(line);
     if (h !== null) {
       const id = uniqueSlug(slugify(S, h.text), ids);
-      const tmp = [];
-      renderInline(h.text, link, tmp);
+      tmp.length = 0;
+      renderInline(h.text, link, tmp, 0, h.text.length);
       const html = tmp.join('');
       blocks.push(`<h${h.depth} id="${id}">${html}</h${h.depth}>\n`);
       if (h.depth === 2 || h.depth === 3) toc.push({ level: h.depth, id, html });
@@ -515,8 +538,9 @@ function renderMarkdown(lines, link, S) {
       }
       if (kept.length === 0) blocks.push('<blockquote>\n</blockquote>\n');
       else {
-        const tmp = [];
-        renderInline(kept.join('\n'), link, tmp);
+        const text = kept.join('\n');
+        tmp.length = 0;
+        renderInline(text, link, tmp, 0, text.length);
         blocks.push(`<blockquote>\n<p>${tmp.join('')}</p>\n</blockquote>\n`);
       }
       continue;
@@ -539,20 +563,22 @@ function renderMarkdown(lines, link, S) {
       }
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && first.start !== 1 ? `<ol start="${first.start}">` : `<${tag}>`;
-      let inner = '';
+      const innerParts = [];
       for (const parts of items) {
-        const tmp = [];
-        renderInline(parts.join('\n'), link, tmp);
-        inner += `<li>${tmp.join('')}</li>\n`;
+        const text = parts.join('\n');
+        tmp.length = 0;
+        renderInline(text, link, tmp, 0, text.length);
+        innerParts.push(`<li>${tmp.join('')}</li>\n`);
       }
-      blocks.push(`${open}\n${inner}</${tag}>\n`);
+      blocks.push(`${open}\n${innerParts.join('')}</${tag}>\n`);
       continue;
     }
     const body = [trimLine(line)];
     i++;
     while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const tmp = [];
-    renderInline(body.join('\n'), link, tmp);
+    const text = body.join('\n');
+    tmp.length = 0;
+    renderInline(text, link, tmp, 0, text.length);
     const html = tmp.join('');
     if (excerpt === null) excerpt = html;
     blocks.push(`<p>${html}</p>\n`);
@@ -809,18 +835,41 @@ function renderNodes(nodes, scope, S, depth, out) {
 
 // ---------------------------------------------------------------- the build
 
+/** Whether `t` opens with a scheme: a letter, then letters, digits, +, - or ., then ':'. */
+function hasScheme(t) {
+  const c0 = t.charCodeAt(0);
+  if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) return false;
+  for (let i = 1; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    if (c === 58) return true;
+    if (!((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 43 || c === 45 || c === 46)) return false;
+  }
+  return false;
+}
+
 /** A source's link resolver: a target with a scheme, or opening on / or #, is kept as written. */
 function makeLink(S, dir, sourcePath) {
+  const dirParts = dir === '' ? [] : dir.split('/');
+  const cache = new Map();
   return (target) => {
-    if (SCHEME_RE.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
-    const hash = target.indexOf('#');
-    const rel = hash === -1 ? target : target.slice(0, hash);
-    const frag = hash === -1 ? '' : target.slice(hash);
-    const path = rel === '' ? null : resolvePath(dir, rel);
-    if (path !== null && S.bySource.has(path)) return `${S.bySource.get(path).url}${frag}`;
-    if (path !== null && S.staticPaths.has(path)) return `${S.base}/${path}${frag}`;
-    S.broken.add(`broken-link ${sourcePath} -> ${target}`);
-    return target;
+    const hit = cache.get(target);
+    if (hit !== undefined) return hit;
+    let href;
+    if (hasScheme(target) || target.startsWith('/') || target.startsWith('#')) href = target;
+    else {
+      const hash = target.indexOf('#');
+      const rel = hash === -1 ? target : target.slice(0, hash);
+      const frag = hash === -1 ? '' : target.slice(hash);
+      const path = rel === '' ? null : resolvePath(dirParts, rel);
+      if (path !== null && S.bySource.has(path)) href = `${S.bySource.get(path).url}${frag}`;
+      else if (path !== null && S.staticPaths.has(path)) href = `${S.base}/${path}${frag}`;
+      else {
+        S.broken.add(`broken-link ${sourcePath} -> ${target}`);
+        href = target;
+      }
+    }
+    cache.set(target, href);
+    return href;
   };
 }
 
@@ -897,8 +946,10 @@ export function run(input) {
   // Sources, in code-unit order of their paths, line ends made "\n".
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   for (const f of files) {
-    if (f.path.endsWith('.md')) S.sources.push({ path: f.path, lines: f.content.replace(/\r\n?/g, '\n').split('\n') });
-    else S.statics.push({ path: f.path, content: f.content });
+    if (f.path.endsWith('.md')) {
+      const raw = f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n');
+      S.sources.push({ path: f.path, lines: raw.split('\n') });
+    } else S.statics.push({ path: f.path, content: f.content });
   }
 
   // Front matter: a refused source is reported and dropped, and so is a draft.
@@ -913,7 +964,6 @@ export function run(input) {
     }
     s.data = fm.data;
     s.bodyLines = s.lines.slice(fm.bodyStart);
-    s.body = s.bodyLines.join('\n');
     s.lines = null;
     s.post = s.path.startsWith('posts/');
     let own;
@@ -971,9 +1021,8 @@ export function run(input) {
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
-    s.words = wordsOf(s.body);
+    s.words = countWords(s.bodyLines);
     s.bodyLines = null;
-    s.body = null;
   }
 
   // Collections: the posts, newest date first, then by slug; newer and older.
